@@ -1,0 +1,15 @@
+[project]
+name = "module-1-sports"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "matplotlib>=3.10.8",
+    "pandas>=2.3.3",
+    "pip>=25.3",
+    "python-docx>=1.2.0",
+    "streamlit>=1.30.0",
+    "plotly>=5.18.0",
+    "pulp>=2.7.0",
+]
