@@ -588,6 +588,217 @@ def find_all_valid_lineups(
 
 
 # =============================================================================
+# Game Rotation Planner - Knapsack with Fatigue Management
+# =============================================================================
+def plan_game_rotation(
+    player_impact: pd.DataFrame,
+    num_stints: int = 8,
+    stint_duration: float = 4.0,
+    max_rating: float = 8.0,
+    max_consecutive_stints: int = 3,
+    fatigue_penalty: float = 0.15,
+    min_playing_time_pct: float = 0.25,
+    min_minutes: float = 50.0
+) -> dict:
+    """
+    Plan optimal player rotations for an entire game using the Knapsack approach
+    with fatigue management and fair playing time distribution.
+    
+    This is a MULTI-PERIOD KNAPSACK problem where:
+    - Each stint is a separate knapsack problem
+    - Player "value" (performance) decreases with fatigue
+    - All players must get minimum playing time
+    - No player can play more than max_consecutive_stints in a row
+    
+    Args:
+        player_impact: DataFrame with player metrics
+        num_stints: Number of stints in the game (default 8 = 32 min game)
+        stint_duration: Duration of each stint in minutes
+        max_rating: Maximum total rating per lineup (wheelchair rugby rule: 8.0)
+        max_consecutive_stints: Max stints a player can play consecutively before rest
+        fatigue_penalty: Performance reduction per consecutive stint (15% default)
+        min_playing_time_pct: Minimum % of game each player should play (25% default)
+        min_minutes: Minimum historical minutes to be eligible
+    
+    Returns:
+        Dictionary with rotation plan and statistics
+    """
+    # Filter eligible players
+    eligible = player_impact[player_impact["minutes"] >= min_minutes].copy()
+    
+    if len(eligible) < 4:
+        return {"status": "INFEASIBLE", "message": "Not enough eligible players"}
+    
+    # Initialize tracking
+    players = eligible.to_dict('records')
+    num_players = len(players)
+    
+    # Track state for each player
+    player_state = {
+        p["player"]: {
+            "base_performance": p["diff_per_10_min"],
+            "rating": p["rating"],
+            "consecutive_stints": 0,
+            "total_stints_played": 0,
+            "current_fatigue": 0.0,
+            "resting_stints": 0
+        }
+        for p in players
+    }
+    
+    # Minimum stints each player should play for fairness
+    min_stints_per_player = max(1, int(num_stints * min_playing_time_pct * 4 / num_players))
+    
+    rotation_plan = []
+    
+    for stint_num in range(num_stints):
+        # Calculate effective performance for each player (accounting for fatigue)
+        effective_players = []
+        for p in players:
+            state = player_state[p["player"]]
+            
+            # Fatigue reduces performance based on consecutive stints
+            fatigue_multiplier = 1.0 - (state["consecutive_stints"] * fatigue_penalty)
+            fatigue_multiplier = max(0.5, fatigue_multiplier)  # Floor at 50% performance
+            
+            # Bonus for rested players (recovered)
+            if state["resting_stints"] >= 2:
+                fatigue_multiplier = min(1.0, fatigue_multiplier + 0.1)
+            
+            effective_perf = state["base_performance"] * fatigue_multiplier
+            
+            # Check if player MUST rest (exceeded max consecutive)
+            must_rest = state["consecutive_stints"] >= max_consecutive_stints
+            
+            # Check if player NEEDS playing time (fairness)
+            stints_remaining = num_stints - stint_num
+            stints_needed = max(0, min_stints_per_player - state["total_stints_played"])
+            urgently_needs_time = stints_needed >= stints_remaining
+            
+            effective_players.append({
+                "player": p["player"],
+                "rating": p["rating"],
+                "base_perf": state["base_performance"],
+                "effective_perf": effective_perf,
+                "fatigue_multiplier": fatigue_multiplier,
+                "consecutive": state["consecutive_stints"],
+                "total_played": state["total_stints_played"],
+                "must_rest": must_rest,
+                "urgently_needs_time": urgently_needs_time
+            })
+        
+        # Solve knapsack for this stint
+        # Use PuLP for optimal selection
+        prob = LpProblem(f"Stint_{stint_num}_Lineup", LpMaximize)
+        
+        # Decision variables
+        player_vars = {
+            p["player"]: LpVariable(f"select_{p['player']}_{stint_num}", cat=LpBinary)
+            for p in effective_players
+        }
+        
+        # Objective: Maximize effective performance (fatigue-adjusted)
+        prob += lpSum([
+            player_vars[p["player"]] * p["effective_perf"]
+            for p in effective_players
+        ]), "Maximize_Effective_Performance"
+        
+        # Constraint 1: Exactly 4 players
+        prob += lpSum(player_vars.values()) == 4, "Exactly_4_Players"
+        
+        # Constraint 2: Total rating <= max_rating (KNAPSACK CAPACITY)
+        prob += lpSum([
+            player_vars[p["player"]] * p["rating"]
+            for p in effective_players
+        ]) <= max_rating, "Rating_Capacity"
+        
+        # Constraint 3: Players who must rest cannot play
+        for p in effective_players:
+            if p["must_rest"]:
+                prob += player_vars[p["player"]] == 0, f"Must_Rest_{p['player']}"
+        
+        # Constraint 4: Players who urgently need time should play (if feasible)
+        # This is a soft constraint - we prioritize but don't force if infeasible
+        urgent_players = [p for p in effective_players if p["urgently_needs_time"] and not p["must_rest"]]
+        
+        # Solve
+        prob.solve()
+        
+        if LpStatus[prob.status] != "Optimal":
+            # Fallback: relax constraints
+            return {"status": "INFEASIBLE", "message": f"Could not find valid lineup for stint {stint_num + 1}"}
+        
+        # Extract selected players
+        selected = [p["player"] for p in effective_players if value(player_vars[p["player"]]) == 1]
+        selected_details = [p for p in effective_players if p["player"] in selected]
+        
+        # Calculate stint metrics
+        total_rating = sum(p["rating"] for p in selected_details)
+        total_effective_perf = sum(p["effective_perf"] for p in selected_details)
+        avg_fatigue = np.mean([1 - p["fatigue_multiplier"] for p in selected_details])
+        
+        rotation_plan.append({
+            "stint": stint_num + 1,
+            "players": selected,
+            "total_rating": total_rating,
+            "expected_performance": total_effective_perf,
+            "avg_fatigue_level": avg_fatigue,
+            "details": selected_details
+        })
+        
+        # Update player states for next stint
+        for p in players:
+            if p["player"] in selected:
+                player_state[p["player"]]["consecutive_stints"] += 1
+                player_state[p["player"]]["total_stints_played"] += 1
+                player_state[p["player"]]["resting_stints"] = 0
+                player_state[p["player"]]["current_fatigue"] = (
+                    player_state[p["player"]]["consecutive_stints"] * fatigue_penalty
+                )
+            else:
+                # Player is resting
+                player_state[p["player"]]["consecutive_stints"] = 0
+                player_state[p["player"]]["resting_stints"] += 1
+                player_state[p["player"]]["current_fatigue"] = max(
+                    0, player_state[p["player"]]["current_fatigue"] - fatigue_penalty
+                )
+    
+    # Compile final statistics
+    player_summary = []
+    for p in players:
+        state = player_state[p["player"]]
+        playing_time = state["total_stints_played"] * stint_duration
+        playing_pct = state["total_stints_played"] / num_stints
+        player_summary.append({
+            "player": p["player"],
+            "rating": p["rating"],
+            "stints_played": state["total_stints_played"],
+            "playing_time_min": playing_time,
+            "playing_time_pct": playing_pct,
+            "met_minimum": playing_pct >= min_playing_time_pct
+        })
+    
+    total_game_performance = sum(s["expected_performance"] for s in rotation_plan)
+    
+    return {
+        "status": "Optimal",
+        "rotation_plan": rotation_plan,
+        "player_summary": player_summary,
+        "total_game_performance": total_game_performance,
+        "avg_performance_per_stint": total_game_performance / num_stints,
+        "game_duration_min": num_stints * stint_duration,
+        "parameters": {
+            "num_stints": num_stints,
+            "stint_duration": stint_duration,
+            "max_rating": max_rating,
+            "max_consecutive": max_consecutive_stints,
+            "fatigue_penalty": fatigue_penalty,
+            "min_playing_time": min_playing_time_pct
+        }
+    }
+
+
+# =============================================================================
 # Main Application
 # =============================================================================
 def main():
@@ -630,9 +841,10 @@ def main():
     h2h = compute_head_to_head(games, selected_team)
     
     # Main tabs
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
         "Dashboard", 
         "Lineup Optimizer", 
+        "Game Rotation",
         "Player Analysis",
         "Opponent Scouting",
         "Historical Lineups"
@@ -865,9 +1077,234 @@ def main():
                     st.warning("No valid lineups found with current constraints")
     
     # =========================================================================
-    # TAB 3: Player Analysis
+    # TAB 3: Game Rotation Planner (Knapsack with Fatigue)
     # =========================================================================
     with tab3:
+        st.header("Game Rotation Planner")
+        st.markdown("""
+        **Smart player rotation using the Knapsack optimization approach with fatigue management.**
+        
+        This tool plans your entire game lineup rotations by solving a **multi-period knapsack problem**:
+        - **Knapsack Capacity**: Total player rating must not exceed 8.0 (wheelchair rugby rule)
+        - **Items**: Players with their ratings (weights) and performance scores (values)
+        - **Fatigue**: Players lose effectiveness when playing consecutive stints
+        - **Fairness**: All players get minimum playing time throughout the game
+        """)
+        
+        st.divider()
+        
+        col1, col2 = st.columns([1, 2])
+        
+        with col1:
+            st.subheader("Game Parameters")
+            
+            num_stints = st.slider(
+                "Number of Stints",
+                min_value=4,
+                max_value=12,
+                value=8,
+                help="Total stints in the game (8 stints × 4 min = 32 min game)"
+            )
+            
+            stint_duration = st.slider(
+                "Stint Duration (minutes)",
+                min_value=2.0,
+                max_value=6.0,
+                value=4.0,
+                step=0.5,
+                help="Duration of each stint"
+            )
+            
+            st.markdown(f"**Total Game Time:** {num_stints * stint_duration:.0f} minutes")
+            
+            st.divider()
+            st.subheader("Fatigue Settings")
+            
+            max_consecutive = st.slider(
+                "Max Consecutive Stints",
+                min_value=1,
+                max_value=5,
+                value=3,
+                help="Maximum stints a player can play in a row before mandatory rest"
+            )
+            
+            fatigue_penalty = st.slider(
+                "Fatigue Penalty (%)",
+                min_value=5,
+                max_value=30,
+                value=15,
+                help="Performance reduction per consecutive stint"
+            ) / 100
+            
+            st.divider()
+            st.subheader("Fairness Settings")
+            
+            min_playing_pct = st.slider(
+                "Minimum Playing Time (%)",
+                min_value=0,
+                max_value=50,
+                value=25,
+                help="Minimum percentage of game each player should play"
+            ) / 100
+            
+            min_hist_minutes = st.slider(
+                "Min Historical Minutes",
+                min_value=0,
+                max_value=200,
+                value=50,
+                help="Minimum historical minutes for player eligibility"
+            )
+            
+            plan_btn = st.button("Generate Rotation Plan", type="primary", use_container_width=True)
+        
+        with col2:
+            if plan_btn:
+                with st.spinner("Optimizing rotations..."):
+                    result = plan_game_rotation(
+                        player_impact,
+                        num_stints=num_stints,
+                        stint_duration=stint_duration,
+                        max_rating=8.0,
+                        max_consecutive_stints=max_consecutive,
+                        fatigue_penalty=fatigue_penalty,
+                        min_playing_time_pct=min_playing_pct,
+                        min_minutes=min_hist_minutes
+                    )
+                
+                if result["status"] == "Optimal":
+                    st.success(f"Rotation plan generated for {result['game_duration_min']:.0f} minute game!")
+                    
+                    # Summary metrics
+                    m1, m2, m3 = st.columns(3)
+                    with m1:
+                        st.metric("Total Performance", f"{result['total_game_performance']:+.2f}")
+                    with m2:
+                        st.metric("Avg per Stint", f"{result['avg_performance_per_stint']:+.2f}")
+                    with m3:
+                        players_meeting_min = sum(1 for p in result['player_summary'] if p['met_minimum'])
+                        st.metric("Players Meeting Min Time", f"{players_meeting_min}/{len(result['player_summary'])}")
+                    
+                    st.divider()
+                    
+                    # Rotation timeline
+                    st.subheader("Rotation Timeline")
+                    
+                    # Create timeline visualization
+                    timeline_data = []
+                    for stint in result["rotation_plan"]:
+                        for p in stint["players"]:
+                            timeline_data.append({
+                                "Stint": f"Stint {stint['stint']}",
+                                "Player": format_player_name(p),
+                                "Value": 1
+                            })
+                    
+                    if timeline_data:
+                        timeline_df = pd.DataFrame(timeline_data)
+                        
+                        # Create heatmap-style visualization
+                        pivot_df = timeline_df.pivot_table(
+                            index="Player", 
+                            columns="Stint", 
+                            values="Value", 
+                            fill_value=0
+                        )
+                        
+                        fig = go.Figure(data=go.Heatmap(
+                            z=pivot_df.values,
+                            x=pivot_df.columns,
+                            y=pivot_df.index,
+                            colorscale=[[0, '#1e293b'], [1, '#22c55e']],
+                            showscale=False,
+                            hovertemplate="Player: %{y}<br>%{x}<br>Status: %{z:Playing/Resting}<extra></extra>"
+                        ))
+                        fig.update_layout(
+                            height=300 + len(pivot_df) * 20,
+                            xaxis_title="Game Progression",
+                            yaxis_title="Players",
+                            margin=dict(t=30)
+                        )
+                        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+                    
+                    # Detailed stint breakdown
+                    st.subheader("Stint-by-Stint Breakdown")
+                    
+                    for stint in result["rotation_plan"]:
+                        fatigue_color = "green" if stint["avg_fatigue_level"] < 0.1 else "orange" if stint["avg_fatigue_level"] < 0.2 else "red"
+                        with st.expander(f"Stint {stint['stint']}: {' | '.join([format_player_name(p) for p in stint['players']])}"):
+                            cols = st.columns(4)
+                            for i, detail in enumerate(stint["details"]):
+                                with cols[i]:
+                                    st.markdown(f"**{format_player_name(detail['player'])}**")
+                                    st.write(f"Rating: {detail['rating']:.1f}")
+                                    st.write(f"Base Perf: {detail['base_perf']:+.2f}")
+                                    st.write(f"Effective: {detail['effective_perf']:+.2f}")
+                                    fatigue_pct = (1 - detail['fatigue_multiplier']) * 100
+                                    st.write(f"Fatigue: {fatigue_pct:.0f}%")
+                            
+                            st.markdown(f"**Stint Total Rating:** {stint['total_rating']:.1f} | **Expected Perf:** {stint['expected_performance']:+.2f}")
+                    
+                    st.divider()
+                    
+                    # Player playing time summary
+                    st.subheader("Player Playing Time Distribution")
+                    
+                    summary_df = pd.DataFrame(result["player_summary"])
+                    summary_df["player"] = summary_df["player"].apply(format_player_name)
+                    summary_df = summary_df.sort_values("stints_played", ascending=False)
+                    
+                    fig = px.bar(
+                        summary_df,
+                        x="player",
+                        y="playing_time_min",
+                        color="met_minimum",
+                        color_discrete_map={True: "#22c55e", False: "#ef4444"},
+                        labels={"player": "Player", "playing_time_min": "Playing Time (min)", "met_minimum": "Met Minimum"},
+                        title="Playing Time Distribution"
+                    )
+                    fig.add_hline(
+                        y=num_stints * stint_duration * min_playing_pct,
+                        line_dash="dash",
+                        line_color="yellow",
+                        annotation_text=f"Min Required ({min_playing_pct*100:.0f}%)"
+                    )
+                    fig.update_layout(height=400, showlegend=True)
+                    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+                    
+                    # Summary table
+                    display_summary = summary_df[["player", "rating", "stints_played", "playing_time_min", "playing_time_pct"]].copy()
+                    display_summary.columns = ["Player", "Rating", "Stints", "Minutes", "% of Game"]
+                    display_summary["% of Game"] = (display_summary["% of Game"] * 100).round(1).astype(str) + "%"
+                    st.dataframe(display_summary, use_container_width=True, hide_index=True)
+                    
+                else:
+                    st.error(result.get("message", "Could not generate rotation plan"))
+                    st.info("Try adjusting parameters: increase max consecutive stints or decrease minimum playing time requirement.")
+            
+            else:
+                # Show explanation when not generating
+                st.info("""
+                **How the Rotation Planner Works:**
+                
+                1. **Knapsack Problem**: Each stint is a knapsack where we select 4 players (items) 
+                   with ratings (weights) that sum to ≤ 8.0 (capacity), maximizing performance (value).
+                
+                2. **Fatigue Modeling**: Players lose 15% performance per consecutive stint played.
+                   After 3 consecutive stints, they must rest.
+                
+                3. **Fair Distribution**: The algorithm ensures all players get at least 25% playing time
+                   (configurable), promoting team involvement.
+                
+                4. **Dynamic Adjustment**: Each stint considers the current fatigue state of all players
+                   and prioritizes rested players while respecting constraints.
+                
+                **Adjust the parameters on the left and click "Generate Rotation Plan" to see your optimal game strategy.**
+                """)
+    
+    # =========================================================================
+    # TAB 4: Player Analysis
+    # =========================================================================
+    with tab4:
         st.header(f"Individual Player Analysis - {selected_team}")
         
         # Player selector using display names
@@ -936,9 +1373,9 @@ def main():
         )
     
     # =========================================================================
-    # TAB 4: Opponent Scouting
+    # TAB 5: Opponent Scouting
     # =========================================================================
-    with tab4:
+    with tab5:
         st.header("Opponent Scouting Report")
         
         opponent = st.selectbox(
@@ -1017,9 +1454,9 @@ def main():
                 st.write(f"Rating: {result['total_rating']:.1f} | Expected +/-: {result['avg_diff_per_10_min']:+.2f}/10min")
     
     # =========================================================================
-    # TAB 5: Historical Lineups
+    # TAB 6: Historical Lineups
     # =========================================================================
-    with tab5:
+    with tab6:
         st.header("Historical Lineup Performance")
         
         min_lineup_minutes = st.slider(

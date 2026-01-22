@@ -1,0 +1,330 @@
+================================================================================
+GAME ROTATION PLANNER - DETAILED EXPLANATION
+================================================================================
+
+WHAT THIS TAB DOES
+------------------
+The Game Rotation Planner is a sophisticated tool that plans your entire game's
+player substitutions by solving a multi-period optimization problem. Instead of
+just finding one optimal lineup, it creates a complete rotation schedule that:
+
+1. Maximizes team performance across ALL stints of the game
+2. Manages player fatigue intelligently
+3. Ensures fair playing time distribution for all players
+4. Respects the wheelchair rugby rating constraint (≤ 8.0)
+
+================================================================================
+THE KNAPSACK PROBLEM CONNECTION
+================================================================================
+
+WHAT IS THE KNAPSACK PROBLEM?
+-----------------------------
+The classic 0/1 Knapsack Problem is:
+- You have a backpack (knapsack) with a weight CAPACITY
+- You have N items, each with a WEIGHT and a VALUE
+- Goal: Select items to maximize total VALUE without exceeding CAPACITY
+
+Mathematically:
+    Maximize: Σ (value_i × x_i)    for all items i
+    Subject to: Σ (weight_i × x_i) ≤ Capacity
+    Where: x_i ∈ {0, 1}  (either take the item or don't)
+
+
+HOW OUR LINEUP PROBLEM IS A KNAPSACK PROBLEM:
+---------------------------------------------
+In wheelchair rugby lineup selection:
+
+| Knapsack Concept | Our Problem                           |
+|------------------|---------------------------------------|
+| Knapsack         | The 4-player lineup                   |
+| Capacity         | Maximum rating = 8.0                  |
+| Items            | Players on the roster                 |
+| Weight           | Player's classification rating        |
+| Value            | Player's performance (diff per 10min) |
+| Selection        | x_i = 1 if player is in lineup        |
+
+MATHEMATICAL FORMULATION:
+-------------------------
+For a single lineup (one stint):
+
+    Maximize:    Σ (performance_i × x_i)     [Total team performance]
+    
+    Subject to:
+        Σ (rating_i × x_i) ≤ 8.0             [Rating capacity constraint]
+        Σ x_i = 4                             [Exactly 4 players]
+        x_i ∈ {0, 1}                          [Binary selection]
+
+This is a BOUNDED KNAPSACK variant because:
+1. We must select EXACTLY 4 items (not just up to capacity)
+2. The capacity (8.0) is on the sum of ratings
+
+================================================================================
+EXTENDING TO MULTI-PERIOD: THE GAME ROTATION PROBLEM
+================================================================================
+
+A single lineup is ONE knapsack problem. But a full game has MULTIPLE stints,
+creating a MULTI-PERIOD KNAPSACK problem with additional complexity:
+
+ADDITIONAL CONSTRAINTS AND CONSIDERATIONS:
+------------------------------------------
+
+1. FATIGUE (Time-Varying Values):
+   - A player's "value" (performance) DECREASES when they play consecutive stints
+   - Fatigue Formula: effective_perf = base_perf × (1 - consecutive_stints × 0.15)
+   - Example: Player with +0.5 base performance:
+     * Stint 1: 0.5 × 1.0 = 0.50 (fresh)
+     * Stint 2: 0.5 × 0.85 = 0.425 (15% fatigue)
+     * Stint 3: 0.5 × 0.70 = 0.35 (30% fatigue)
+
+2. MANDATORY REST (Hard Constraint):
+   - No player can play more than 3 consecutive stints
+   - After 3 stints, x_player = 0 (forced to bench)
+
+3. FAIR PLAYING TIME (Soft Constraint):
+   - All players should get at least 25% of game time
+   - Algorithm prioritizes underplayed players when feasible
+
+4. RECOVERY (State Transition):
+   - Rested players recover fatigue
+   - After 2 stints of rest, fatigue resets
+
+COMPLETE MULTI-PERIOD FORMULATION:
+----------------------------------
+For each stint t ∈ {1, 2, ..., T}:
+
+    Maximize:    Σ (effective_perf_{i,t} × x_{i,t})
+    
+    Subject to:
+        Σ (rating_i × x_{i,t}) ≤ 8.0           [Rating capacity]
+        Σ x_{i,t} = 4                           [4 players per stint]
+        x_{i,t} = 0 if consecutive_{i,t} ≥ 3    [Mandatory rest]
+        x_{i,t} ∈ {0, 1}                        [Binary]
+    
+    State Update:
+        If x_{i,t} = 1: consecutive_{i,t+1} = consecutive_{i,t} + 1
+        If x_{i,t} = 0: consecutive_{i,t+1} = 0
+
+Where:
+    effective_perf_{i,t} = base_perf_i × (1 - consecutive_{i,t} × fatigue_penalty)
+
+================================================================================
+THE ALGORITHM: HOW WE SOLVE IT
+================================================================================
+
+We use a GREEDY SEQUENTIAL approach combined with LINEAR PROGRAMMING:
+
+STEP 1: Initialize Player States
+--------------------------------
+For each player, track:
+- Base performance (from historical data)
+- Rating (from classification)
+- Consecutive stints played (starts at 0)
+- Total stints played (starts at 0)
+- Current fatigue level (starts at 0%)
+
+STEP 2: For Each Stint, Solve a Knapsack
+----------------------------------------
+For stint t = 1 to T:
+    
+    a) Calculate EFFECTIVE PERFORMANCE for each player:
+       - Apply fatigue penalty based on consecutive stints
+       - Minimum performance floor at 50% (heavily fatigued but still playable)
+       - Recovery bonus for well-rested players
+    
+    b) Identify CONSTRAINTS:
+       - Must rest: players with 3+ consecutive stints
+       - Needs playing time: players below minimum threshold
+    
+    c) Solve LINEAR PROGRAM:
+       - Create binary variable for each non-resting player
+       - Maximize sum of effective performances
+       - Constraint: exactly 4 selected
+       - Constraint: total rating ≤ 8.0
+       - Constraint: resting players cannot be selected
+    
+    d) Update STATES for next stint:
+       - Selected players: increment consecutive count
+       - Benched players: reset consecutive to 0, increment rest count
+
+STEP 3: Compile Results
+-----------------------
+- Full rotation schedule for all stints
+- Playing time distribution for each player
+- Total expected game performance
+- Fatigue analysis
+
+WHY THIS APPROACH?
+------------------
+1. GREEDY SEQUENTIAL is simpler than full multi-period optimization
+2. LINEAR PROGRAMMING ensures each stint is truly optimal given constraints
+3. State tracking handles the temporal dependencies (fatigue, rest)
+4. Scales well to longer games with more stints
+
+COMPUTATIONAL COMPLEXITY:
+-------------------------
+- For each stint: O(n) where n = number of players
+- LP solver: typically O(n²) for small binary problems
+- Total: O(T × n²) where T = number of stints
+- In practice: < 1 second for a full game rotation
+
+================================================================================
+HOW TO USE THE GAME ROTATION TAB
+================================================================================
+
+STEP 1: Set Game Parameters
+---------------------------
+- Number of Stints: How many substitution periods (default: 8)
+- Stint Duration: Minutes per stint (default: 4 min)
+- Together these define your game length (8 × 4 = 32 minutes)
+
+STEP 2: Configure Fatigue Settings
+----------------------------------
+- Max Consecutive Stints: How many stints before mandatory rest (default: 3)
+  * Lower = more frequent rotations, fresher players
+  * Higher = more flexibility, potentially more fatigue
+  
+- Fatigue Penalty: Performance loss per consecutive stint (default: 15%)
+  * Higher penalty = algorithm rotates more aggressively
+  * Lower penalty = star players can play longer
+
+STEP 3: Set Fairness Requirements
+---------------------------------
+- Minimum Playing Time: % of game each player should play (default: 25%)
+  * Higher = more equitable distribution
+  * Lower = more performance-focused (stars play more)
+  
+- Min Historical Minutes: Filter for experienced players (default: 50)
+
+STEP 4: Generate and Analyze
+----------------------------
+Click "Generate Rotation Plan" to see:
+
+1. ROTATION TIMELINE: Visual heatmap showing who plays when
+   - Green = playing, Dark = resting
+   - Easy to see rotation patterns
+
+2. STINT BREAKDOWN: Detailed view of each stint
+   - Who's playing
+   - Their fatigue levels
+   - Expected performance
+
+3. PLAYING TIME DISTRIBUTION: Bar chart showing minutes per player
+   - Green bars = met minimum playing time
+   - Red bars = below minimum (may indicate need to adjust parameters)
+   - Yellow line = minimum threshold
+
+================================================================================
+PRACTICAL COACHING INSIGHTS
+================================================================================
+
+SCENARIO 1: Star Player Management
+----------------------------------
+Your best player (highest diff_per_10_min) shouldn't play every stint because:
+- Fatigue reduces their effectiveness
+- They might get injured
+- Other players need development
+
+The algorithm automatically rotates them, typically playing 3 stints, resting 1,
+then returning refreshed.
+
+SCENARIO 2: Rating Efficiency
+-----------------------------
+High-rated players (3.0, 3.5) "cost" more of your 8.0 budget. The algorithm
+often finds combinations like:
+
+    High-performer (2.5) + Solid player (2.0) + Low-rated (0.5) + Low-rated (1.0)
+    = 6.0 total rating (leaves room for flexibility)
+
+Rather than:
+    Three 2.5-rated players + one 0.5-rated player
+    = 8.0 total rating (no flexibility)
+
+SCENARIO 3: Endgame Strategy
+----------------------------
+In later stints, the algorithm considers:
+- Which players haven't met their minimum playing time
+- Who is freshest (been resting)
+- Rating combinations that still work
+
+This ensures you have fresh legs for crucial late-game moments.
+
+SCENARIO 4: Injury Simulation
+-----------------------------
+If a player gets injured mid-game:
+1. Exclude them from the roster
+2. Re-run the rotation planner for remaining stints
+3. Algorithm redistributes time among healthy players
+
+================================================================================
+COMPARISON: SINGLE LINEUP vs. GAME ROTATION
+================================================================================
+
+| Aspect              | Lineup Optimizer      | Game Rotation Planner    |
+|---------------------|----------------------|--------------------------|
+| Scope               | One stint            | Entire game              |
+| Fatigue             | Not considered       | Core feature             |
+| Fair play time      | Not considered       | Guaranteed               |
+| Output              | 4 players            | Full substitution plan   |
+| Complexity          | Single knapsack      | Multi-period knapsack    |
+| Use case            | Quick recommendation | Pre-game planning        |
+
+================================================================================
+THE OBJECTIVE FUNCTION AND CONSTRAINTS SUMMARY
+================================================================================
+
+OBJECTIVE FUNCTION:
+-------------------
+Maximize total game performance:
+
+    Maximize Σ_{t=1}^{T} Σ_{i=1}^{n} (effective_perf_{i,t} × x_{i,t})
+
+Where:
+- T = number of stints in the game
+- n = number of eligible players
+- effective_perf_{i,t} = base_perf_i × fatigue_multiplier_{i,t}
+- x_{i,t} = 1 if player i plays in stint t, 0 otherwise
+
+CONSTRAINTS:
+------------
+1. RATING CAPACITY (Knapsack):
+   Σ (rating_i × x_{i,t}) ≤ 8.0    for all stints t
+
+2. TEAM SIZE:
+   Σ x_{i,t} = 4                    for all stints t
+
+3. MANDATORY REST:
+   x_{i,t} = 0    if consecutive_{i,t-1} ≥ max_consecutive
+
+4. BINARY SELECTION:
+   x_{i,t} ∈ {0, 1}                 for all players i, stints t
+
+5. FAIR PLAY TIME (soft, handled via prioritization):
+   Σ_{t=1}^{T} x_{i,t} ≥ min_stints    for all players i
+
+STATE TRANSITIONS:
+------------------
+consecutive_{i,t} = {
+    consecutive_{i,t-1} + 1    if x_{i,t-1} = 1
+    0                          if x_{i,t-1} = 0
+}
+
+================================================================================
+TECHNICAL IMPLEMENTATION NOTES
+================================================================================
+
+LIBRARY USED: PuLP (Python Linear Programming)
+- Creates optimization model for each stint
+- Solves binary integer program
+- Guarantees optimal solution for each stint
+
+FATIGUE MODEL:
+- Linear decay: 15% performance loss per consecutive stint
+- Floor at 50%: Even exhausted players contribute something
+- Recovery: 2 stints of rest fully recovers fatigue
+
+SOLVER: CBC (Coin-or Branch and Cut)
+- Open source, fast for small problems
+- Handles binary constraints efficiently
+- Typically solves each stint in <10ms
+
+================================================================================
