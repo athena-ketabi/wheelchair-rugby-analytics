@@ -672,8 +672,8 @@ def plan_game_rotation(
             
             # Check if player NEEDS playing time (fairness)
             stints_remaining = num_stints - stint_num
+
             stints_needed = max(0, min_stints_per_player - state["total_stints_played"])
-            urgently_needs_time = stints_needed >= stints_remaining
             
             effective_players.append({
                 "player": p["player"],
@@ -684,7 +684,6 @@ def plan_game_rotation(
                 "consecutive": state["consecutive_stints"],
                 "total_played": state["total_stints_played"],
                 "must_rest": must_rest,
-                "urgently_needs_time": urgently_needs_time
             })
         
         # Solve knapsack for this stint
@@ -716,11 +715,7 @@ def plan_game_rotation(
         for p in effective_players:
             if p["must_rest"]:
                 prob += player_vars[p["player"]] == 0, f"Must_Rest_{p['player']}"
-        
-        # Constraint 4: Players who urgently need time should play (if feasible)
-        # This is a soft constraint - we prioritize but don't force if infeasible
-        urgent_players = [p for p in effective_players if p["urgently_needs_time"] and not p["must_rest"]]
-        
+                
         # Solve
         prob.solve()
         
